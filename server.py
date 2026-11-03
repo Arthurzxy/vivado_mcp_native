@@ -340,8 +340,30 @@ def parse_timing_summary(output: str) -> dict:
         "raw": output  # Keep raw output for detailed analysis
     }
 
-    # Parse WNS/TNS (setup timing) using regex
-    # Format: "WNS(ns)      :  1.234" or similar
+    # Vivado prints the "Design Timing Summary" as a table: a header row of
+    # column names separated by 2+ spaces, a dashes row, then the values row.
+    lines = output.splitlines()
+    for i, line in enumerate(lines[:-2]):
+        if "WNS(ns)" in line and "WHS(ns)" in line:
+            headers = re.split(r"\s{2,}", line.strip())
+            values = lines[i + 2].split()
+            if len(values) != len(headers):
+                continue
+            row = dict(zip(headers, values))
+            keys = {"wns": "WNS(ns)", "tns": "TNS(ns)", "whs": "WHS(ns)",
+                    "ths": "THS(ns)", "wpws": "WPWS(ns)", "tpws": "TPWS(ns)"}
+            for key, header in keys.items():
+                if row.get(header, "NA") != "NA":
+                    result[key] = float(row[header])
+            result["failing_endpoints"] = sum(
+                int(v) for h, v in row.items()
+                if h.endswith("Failing Endpoints") and v.isdigit()
+            )
+            if result["wns"] is not None and result["whs"] is not None:
+                result["met"] = result["wns"] >= 0 and result["whs"] >= 0
+            return result
+
+    # Fallback: "WNS(ns)      :  1.234" style
     wns_match = re.search(r"WNS\(ns\)\s*:\s*([-\d.]+)", output)
     tns_match = re.search(r"TNS\(ns\)\s*:\s*([-\d.]+)", output)
     if wns_match:
@@ -402,24 +424,39 @@ def parse_utilization(output: str) -> dict:
         "raw": output  # Keep raw output for detailed analysis
     }
 
-    # Regex patterns for each resource type
-    # Vivado's table format: "Resource | Used | Fixed | Available | Util%"
-    # Different device families use slightly different names
-    patterns = {
-        "lut": r"(?:Slice LUTs|CLB LUTs)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)",
-        "ff": r"(?:Slice Registers|CLB Registers)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)",
-        "bram": r"Block RAM Tile\s*\|\s*(\d+\.?\d*)\s*\|\s*\d+\s*\|\s*(\d+\.?\d*)\s*\|\s*([\d.]+)",
-        "dsp": r"DSPs?\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)",
-        "io": r"(?:Bonded IOB|Bonded User I/O)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)"
+    # Row names per resource; different device families use different names
+    names = {
+        "lut": ("Slice LUTs", "CLB LUTs"),
+        "ff": ("Slice Registers", "CLB Registers"),
+        "bram": ("Block RAM Tile",),
+        "dsp": ("DSPs", "DSP"),
+        "io": ("Bonded IOB", "Bonded User I/O"),
     }
 
-    # Apply each pattern and extract values
-    for resource, pattern in patterns.items():
-        match = re.search(pattern, output, re.IGNORECASE)
-        if match:
-            result[resource]["used"] = float(match.group(1))
-            result[resource]["available"] = float(match.group(2))
-            result[resource]["percent"] = float(match.group(3))
+    # Columns are looked up by header name: newer Vivado versions insert a
+    # "Prohibited" column between "Fixed" and "Available".
+    columns = None
+    found = set()
+    for line in output.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if "Used" in cells and "Available" in cells:
+            columns = {name: idx for idx, name in enumerate(cells)}
+            continue
+        if columns is None or len(cells) != len(columns):
+            continue
+        for resource, aliases in names.items():
+            if resource not in found and cells[0] in aliases:
+                try:
+                    used, available, percent = (
+                        float(cells[columns[c]].lstrip("<"))  # Util% can be "<0.01"
+                        for c in ("Used", "Available", "Util%")
+                    )
+                except (KeyError, ValueError):
+                    continue
+                result[resource].update(used=used, available=available, percent=percent)
+                found.add(resource)
 
     return result
 
